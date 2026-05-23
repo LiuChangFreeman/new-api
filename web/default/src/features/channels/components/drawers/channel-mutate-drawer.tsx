@@ -238,6 +238,7 @@ function hasAdvancedSettingsValues(values: ChannelFormValues): boolean {
     values.force_format ||
     values.thinking_to_content ||
     values.pass_through_body_enabled ||
+    values.responses_transcript_replay_enabled ||
     values.system_prompt_override ||
     values.claude_beta_query ||
     values.upstream_model_update_check_enabled ||
@@ -3135,6 +3136,31 @@ export function ChannelMutateDrawer({
                               <FormLabel>{t('Pass Through Body')}</FormLabel>
                               <FormDescription>
                                 {t('Pass request body directly to upstream')}
+                              </FormDescription>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+
+                      <FormField
+                        control={form.control}
+                        name='responses_transcript_replay_enabled'
+                        render={({ field }) => (
+                          <FormItem className='flex items-center justify-between px-4 py-3'>
+                            <div className='space-y-0.5'>
+                              <FormLabel>
+                                {t('响应会话重放')}
+                              </FormLabel>
+                              <FormDescription>
+                                {t(
+                                  '遇到 encrypted_content 校验失败时，移除 previous_response_id 并重放完整会话记录'
+                                )}
                               </FormDescription>
                             </div>
                             <FormControl>
