@@ -65,6 +65,33 @@ func TestShouldUseResponsesTranscriptReplayIgnoresNormalOpenAIResponsesChannel(t
 	require.False(t, shouldUseResponsesTranscriptReplay(info))
 }
 
+func TestShouldRewriteResponsesCustomPromptRequiresSwitchAndXHigh(t *testing.T) {
+	info := &relaycommon.RelayInfo{
+		RelayMode:       relayconstant.RelayModeResponses,
+		ReasoningEffort: "xhigh",
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelOtherSettings: dto.ChannelOtherSettings{
+				CustomPromptRewriteEnabled: true,
+			},
+		},
+	}
+
+	require.True(t, shouldRewriteResponsesCustomPrompt(info))
+
+	info.ReasoningEffort = "high"
+	require.False(t, shouldRewriteResponsesCustomPrompt(info))
+
+	info.ChannelOtherSettings.CustomPromptRewriteEnabled = false
+	info.ReasoningEffort = "xhigh"
+	require.False(t, shouldRewriteResponsesCustomPrompt(info))
+}
+
+func TestResponsesReasoningEffortFromBody(t *testing.T) {
+	require.Equal(t, "xhigh", responsesReasoningEffortFromBody([]byte(`{"reasoning":{"effort":"xhigh"},"model":"gpt-5.5"}`)))
+	require.Equal(t, "xhigh", responsesReasoningEffortFromBody([]byte(`{"model":"gpt-5.5-xhigh"}`)))
+	require.Equal(t, "high", responsesReasoningEffortFromBody([]byte(`{"reasoning":{"effort":"high"},"model":"gpt-5.5-xhigh"}`)))
+}
+
 func TestShouldRetryResponsesTranscriptReplayIgnoresPayloadTooLarge(t *testing.T) {
 	require.False(t, shouldRetryResponsesTranscriptReplay(413, []byte(`<html>too large</html>`), []byte(`{
 		"input":[{"type":"reasoning","encrypted_content":"bad-ciphertext","summary":[]}]

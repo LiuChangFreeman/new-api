@@ -17,9 +17,11 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
@@ -87,11 +89,17 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		}
 		requestBody = common.ReaderOnly(storage)
 		info.UpstreamRequestBodySize = storage.Size()
-		if shouldUseResponsesTranscriptReplay(info) {
+		if shouldConsiderResponsesCustomPromptRewrite(info) || shouldUseResponsesTranscriptReplay(info) {
 			if bodyBytes, err := storage.Bytes(); err == nil {
 				requestBodyBytes = append([]byte(nil), bodyBytes...)
-				relaycommon.PrepareResponsesTranscriptReplay(info, requestBodyBytes)
 				shouldRewriteBody := false
+				if rewrittenBody, ok := rewriteResponsesCustomPromptIfNeeded(c, info, requestBodyBytes); ok {
+					requestBodyBytes = rewrittenBody
+					shouldRewriteBody = true
+				}
+				if shouldUseResponsesTranscriptReplay(info) {
+					relaycommon.PrepareResponsesTranscriptReplay(info, requestBodyBytes)
+				}
 				if sanitizedBody, ok := sanitizeResponsesTranscriptInitialRequest(c, info, requestBodyBytes); ok {
 					requestBodyBytes = sanitizedBody
 					shouldRewriteBody = true
@@ -105,7 +113,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 					requestBody = body
 				}
 			} else {
-				logger.LogWarn(c, fmt.Sprintf("codex responses transcript replay disabled: read pass-through body failed: %s", err.Error()))
+				logger.LogWarn(c, fmt.Sprintf("codex responses pass-through body rewrite disabled: read body failed: %s", err.Error()))
 			}
 		}
 	} else {
@@ -133,8 +141,11 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			}
 		}
 
-		logger.LogDebug(c, "requestBody: %s", jsonData)
 		requestBodyBytes = append([]byte(nil), jsonData...)
+		if rewrittenBody, ok := rewriteResponsesCustomPromptIfNeeded(c, info, requestBodyBytes); ok {
+			requestBodyBytes = rewrittenBody
+		}
+		logger.LogDebug(c, "requestBody: %s", requestBodyBytes)
 		if shouldUseResponsesTranscriptReplay(info) {
 			relaycommon.PrepareResponsesTranscriptReplay(info, requestBodyBytes)
 			if sanitizedBody, ok := sanitizeResponsesTranscriptInitialRequest(c, info, requestBodyBytes); ok {
@@ -226,6 +237,79 @@ func shouldUseResponsesTranscriptReplay(info *relaycommon.RelayInfo) bool {
 		return false
 	}
 	return info.ChannelOtherSettings.ResponsesTranscriptReplayEnabled
+}
+
+func shouldConsiderResponsesCustomPromptRewrite(info *relaycommon.RelayInfo) bool {
+	if info == nil || !info.ChannelOtherSettings.CustomPromptRewriteEnabled {
+		return false
+	}
+	return info.RelayMode == relayconstant.RelayModeResponses ||
+		info.RelayMode == relayconstant.RelayModeResponsesCompact
+}
+
+func shouldRewriteResponsesCustomPrompt(info *relaycommon.RelayInfo) bool {
+	if !shouldConsiderResponsesCustomPromptRewrite(info) {
+		return false
+	}
+	return isResponsesXHighReasoningEffort(info.ReasoningEffort)
+}
+
+func rewriteResponsesCustomPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, requestBodyBytes []byte) ([]byte, bool) {
+	if !shouldConsiderResponsesCustomPromptRewrite(info) || len(requestBodyBytes) == 0 {
+		return nil, false
+	}
+
+	if bodyEffort := responsesReasoningEffortFromBody(requestBodyBytes); bodyEffort != "" {
+		info.ReasoningEffort = bodyEffort
+	}
+	if !shouldRewriteResponsesCustomPrompt(info) {
+		return nil, false
+	}
+
+	rewrittenBody, ok, reason, err := relaycommon.RewriteResponsesCustomPrompt(requestBodyBytes)
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf("codex responses custom prompt rewrite skipped on channel #%d: %s: %v", info.ChannelId, reason, err))
+		return nil, false
+	}
+	if !ok {
+		return nil, false
+	}
+
+	logResponsesInfo(c, fmt.Sprintf(
+		"codex responses custom prompt rewrite on channel #%d: %s; original_body_bytes=%d rewritten_body_bytes=%d",
+		info.ChannelId,
+		reason,
+		len(requestBodyBytes),
+		len(rewrittenBody),
+	))
+	return rewrittenBody, true
+}
+
+func responsesReasoningEffortFromBody(requestBodyBytes []byte) string {
+	if len(requestBodyBytes) == 0 {
+		return ""
+	}
+	if effort := strings.TrimSpace(gjsonString(requestBodyBytes, "reasoning.effort")); effort != "" {
+		return effort
+	}
+	model := strings.TrimSpace(gjsonString(requestBodyBytes, "model"))
+	if model == "" {
+		return ""
+	}
+	effort, _ := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(model)
+	return effort
+}
+
+func gjsonString(data []byte, path string) string {
+	value := gjson.GetBytes(data, path)
+	if value.Type != gjson.String {
+		return ""
+	}
+	return value.String()
+}
+
+func isResponsesXHighReasoningEffort(effort string) bool {
+	return strings.EqualFold(strings.TrimSpace(effort), "xhigh")
 }
 
 func newResponsesOutboundJSONBody(info *relaycommon.RelayInfo, requestBody []byte) (io.Reader, io.Closer, *types.NewAPIError) {
