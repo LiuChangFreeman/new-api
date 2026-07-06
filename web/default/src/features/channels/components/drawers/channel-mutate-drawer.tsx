@@ -238,6 +238,8 @@ function hasAdvancedSettingsValues(values: ChannelFormValues): boolean {
     values.force_format ||
     values.thinking_to_content ||
     values.pass_through_body_enabled ||
+    values.responses_transcript_replay_enabled ||
+    values.custom_prompt_rewrite_enabled ||
     values.system_prompt_override ||
     values.claude_beta_query ||
     values.upstream_model_update_check_enabled ||
@@ -3135,6 +3137,54 @@ export function ChannelMutateDrawer({
                               <FormLabel>{t('Pass Through Body')}</FormLabel>
                               <FormDescription>
                                 {t('Pass request body directly to upstream')}
+                              </FormDescription>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+
+                      <FormField
+                        control={form.control}
+                        name='responses_transcript_replay_enabled'
+                        render={({ field }) => (
+                          <FormItem className='flex items-center justify-between px-4 py-3'>
+                            <div className='space-y-0.5'>
+                              <FormLabel>
+                                {t('加密内容校验重试')}
+                              </FormLabel>
+                              <FormDescription>
+                                {t(
+                                  '遇到加密内容校验失败时，自动清理无效推理内容并重试'
+                                )}
+                              </FormDescription>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+
+                      <FormField
+                        control={form.control}
+                        name='custom_prompt_rewrite_enabled'
+                        render={({ field }) => (
+                          <FormItem className='flex items-center justify-between px-4 py-3'>
+                            <div className='space-y-0.5'>
+                              <FormLabel>{t('自定义prompt改写')}</FormLabel>
+                              <FormDescription>
+                                {t(
+                                  '仅在 xhigh 思考强度下生效；会删除 Codex 系统提示词中从 "## Intermediary updates" 开始到结尾的段落'
+                                )}
                               </FormDescription>
                             </div>
                             <FormControl>

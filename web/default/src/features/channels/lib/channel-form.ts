@@ -71,6 +71,8 @@ export const channelFormSchema = z.object({
   disable_store: z.boolean().optional(), // OpenAI only
   allow_safety_identifier: z.boolean().optional(), // OpenAI only
   allow_include_obfuscation: z.boolean().optional(), // OpenAI: include usage obfuscation
+  responses_transcript_replay_enabled: z.boolean().optional(),
+  custom_prompt_rewrite_enabled: z.boolean().optional(),
   allow_inference_geo: z.boolean().optional(), // OpenAI/Anthropic: inference geography
   allow_speed: z.boolean().optional(), // Anthropic: speed mode control
   claude_beta_query: z.boolean().optional(), // Anthropic: beta query passthrough
@@ -129,6 +131,8 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   disable_store: false,
   allow_safety_identifier: false,
   allow_include_obfuscation: false,
+  responses_transcript_replay_enabled: false,
+  custom_prompt_rewrite_enabled: false,
   allow_inference_geo: false,
   allow_speed: false,
   claude_beta_query: false,
@@ -183,6 +187,8 @@ export function transformChannelToFormDefaults(
   let disableStore = false
   let allowSafetyIdentifier = false
   let allowIncludeObfuscation = false
+  let responsesTranscriptReplayEnabled = false
+  let customPromptRewriteEnabled = false
   let allowInferenceGeo = false
   let allowSpeed = false
   let claudeBetaQuery = false
@@ -201,6 +207,9 @@ export function transformChannelToFormDefaults(
       disableStore = parsed.disable_store === true
       allowSafetyIdentifier = parsed.allow_safety_identifier === true
       allowIncludeObfuscation = parsed.allow_include_obfuscation === true
+      responsesTranscriptReplayEnabled =
+        parsed.responses_transcript_replay_enabled === true
+      customPromptRewriteEnabled = parsed.custom_prompt_rewrite_enabled === true
       allowInferenceGeo = parsed.allow_inference_geo === true
       allowSpeed = parsed.allow_speed === true
       claudeBetaQuery = parsed.claude_beta_query === true
@@ -255,6 +264,8 @@ export function transformChannelToFormDefaults(
     allow_service_tier: allowServiceTier,
     disable_store: disableStore,
     allow_include_obfuscation: allowIncludeObfuscation,
+    responses_transcript_replay_enabled: responsesTranscriptReplayEnabled,
+    custom_prompt_rewrite_enabled: customPromptRewriteEnabled,
     allow_inference_geo: allowInferenceGeo,
     allow_speed: allowSpeed,
     claude_beta_query: claudeBetaQuery,
@@ -348,6 +359,18 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
       delete settingsObj.allow_include_obfuscation
     if (formData.type !== 14 && 'allow_inference_geo' in settingsObj)
       delete settingsObj.allow_inference_geo
+  }
+
+  if (formData.responses_transcript_replay_enabled === true) {
+    settingsObj.responses_transcript_replay_enabled = true
+  } else if ('responses_transcript_replay_enabled' in settingsObj) {
+    delete settingsObj.responses_transcript_replay_enabled
+  }
+
+  if (formData.custom_prompt_rewrite_enabled === true) {
+    settingsObj.custom_prompt_rewrite_enabled = true
+  } else if ('custom_prompt_rewrite_enabled' in settingsObj) {
+    delete settingsObj.custom_prompt_rewrite_enabled
   }
 
   // Anthropic (type 14): claude_beta_query, allow_inference_geo, allow_speed

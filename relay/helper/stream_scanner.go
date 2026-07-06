@@ -25,6 +25,7 @@ const (
 	InitialScannerBufferSize    = 64 << 10 // 64KB (64*1024)
 	DefaultMaxScannerBufferSize = 64 << 20 // 64MB (64*1024*1024) default SSE buffer size
 	DefaultPingInterval         = 10 * time.Second
+	DefaultStreamingTimeout     = 60 * time.Second
 )
 
 func getScannerBufferSize() int {
@@ -34,14 +35,28 @@ func getScannerBufferSize() int {
 	return DefaultMaxScannerBufferSize
 }
 
+func parseStreamDataLine(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	switch {
+	case strings.HasPrefix(line, "data:"):
+		data := strings.TrimSpace(line[5:])
+		return data, data != ""
+	case strings.HasPrefix(line, "[DONE]"):
+		return "[DONE]", true
+	default:
+		return "", false
+	}
+}
+
 func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
 
-	if resp == nil || dataHandler == nil {
+	if resp == nil || dataHandler == nil || info == nil {
 		return
 	}
 
-	// 无条件新建 StreamStatus
-	info.StreamStatus = relaycommon.NewStreamStatus()
+	if info.StreamStatus == nil {
+		info.StreamStatus = relaycommon.NewStreamStatus()
+	}
 
 	// 确保响应体总是被关闭
 	defer func() {
@@ -51,6 +66,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	}()
 
 	streamingTimeout := time.Duration(constant.StreamingTimeout) * time.Second
+	if streamingTimeout <= 0 {
+		streamingTimeout = DefaultStreamingTimeout
+	}
 
 	var (
 		stopChan   = make(chan bool, 3) // 增加缓冲区避免阻塞
@@ -60,6 +78,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		writeMutex sync.Mutex     // Mutex to protect concurrent writes
 		wg         sync.WaitGroup // 用于等待所有 goroutine 退出
 	)
+	var cleanupOnce sync.Once
 
 	generalSettings := operation_setting.GetGeneralSetting()
 	pingEnabled := generalSettings.PingIntervalEnabled && !info.DisablePing
@@ -79,30 +98,33 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	logger.LogDebug(c, "ping interval seconds: %d", int64(pingInterval.Seconds()))
 
 	// 改进资源清理，确保所有 goroutine 正确退出
-	defer func() {
+	cleanup := func() {
 		// 通知所有 goroutine 停止
-		common.SafeSendBool(stopChan, true)
+		cleanupOnce.Do(func() {
+			common.SafeSendBool(stopChan, true)
 
-		ticker.Stop()
-		if pingTicker != nil {
-			pingTicker.Stop()
-		}
+			ticker.Stop()
+			if pingTicker != nil {
+				pingTicker.Stop()
+			}
 
-		// 等待所有 goroutine 退出，最多等待5秒
-		done := make(chan struct{})
-		gopool.Go(func() {
-			wg.Wait()
-			close(done)
+			// 等待所有 goroutine 退出，最多等待5秒
+			done := make(chan struct{})
+			gopool.Go(func() {
+				wg.Wait()
+				close(done)
+			})
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				logger.LogError(c, "timeout waiting for goroutines to exit")
+			}
+
+			close(stopChan)
 		})
-
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			logger.LogError(c, "timeout waiting for goroutines to exit")
-		}
-
-		close(stopChan)
-	}()
+	}
+	defer cleanup()
 
 	scanner.Buffer(make([]byte, InitialScannerBufferSize), getScannerBufferSize())
 	scanner.Split(bufio.ScanLines)
@@ -226,21 +248,17 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			default:
 			}
 
-			ticker.Reset(streamingTimeout)
-			data := scanner.Text()
-			logger.LogDebug(c, "stream scanner data: %s", data)
+			rawLine := scanner.Text()
+			logger.LogDebug(c, "stream scanner data: %s", rawLine)
 
-			if len(data) < 6 {
+			data, ok := parseStreamDataLine(rawLine)
+			if !ok {
+				if info.HasSendResponse() {
+					ticker.Reset(streamingTimeout)
+				}
 				continue
 			}
-			if data[:5] != "data:" && data[:6] != "[DONE]" {
-				continue
-			}
-			data = data[5:]
-			data = strings.TrimSpace(data)
-			if data == "" {
-				continue
-			}
+			ticker.Reset(streamingTimeout)
 			if !strings.HasPrefix(data, "[DONE]") {
 				info.SetFirstResponseTime()
 				info.ReceivedResponseCount++
@@ -277,6 +295,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	case <-c.Request.Context().Done():
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
 	}
+
+	cleanup()
 
 	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
 		logger.LogInfo(c, fmt.Sprintf("stream ended: %s", info.StreamStatus.Summary()))

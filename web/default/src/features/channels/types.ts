@@ -97,6 +97,8 @@ export interface ChannelOtherSettings {
   disable_store?: boolean
   allow_safety_identifier?: boolean
   allow_include_obfuscation?: boolean
+  responses_transcript_replay_enabled?: boolean
+  custom_prompt_rewrite_enabled?: boolean
   allow_inference_geo?: boolean
   allow_speed?: boolean
   claude_beta_query?: boolean

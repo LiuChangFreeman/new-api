@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,14 +11,17 @@ import (
 	appconstant "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	relaychannel "github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
@@ -71,12 +75,47 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	}
 	adaptor.Init(info)
 	var requestBody io.Reader
+	var requestBodyBytes []byte
+	var requestBodyCloser io.Closer
+	defer func() {
+		if requestBodyCloser != nil {
+			_ = requestBodyCloser.Close()
+		}
+	}()
 	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
 		storage, err := common.GetBodyStorage(c)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
 		}
 		requestBody = common.ReaderOnly(storage)
+		info.UpstreamRequestBodySize = storage.Size()
+		if shouldConsiderResponsesCustomPromptRewrite(info) || shouldUseResponsesTranscriptReplay(info) {
+			if bodyBytes, err := storage.Bytes(); err == nil {
+				requestBodyBytes = append([]byte(nil), bodyBytes...)
+				shouldRewriteBody := false
+				if rewrittenBody, ok := rewriteResponsesCustomPromptIfNeeded(c, info, requestBodyBytes); ok {
+					requestBodyBytes = rewrittenBody
+					shouldRewriteBody = true
+				}
+				if shouldUseResponsesTranscriptReplay(info) {
+					relaycommon.PrepareResponsesTranscriptReplay(info, requestBodyBytes)
+				}
+				if sanitizedBody, ok := sanitizeResponsesTranscriptInitialRequest(c, info, requestBodyBytes); ok {
+					requestBodyBytes = sanitizedBody
+					shouldRewriteBody = true
+				}
+				if shouldRewriteBody {
+					body, closer, newAPIError := newResponsesOutboundJSONBody(info, requestBodyBytes)
+					if newAPIError != nil {
+						return newAPIError
+					}
+					requestBodyCloser = closer
+					requestBody = body
+				}
+			} else {
+				logger.LogWarn(c, fmt.Sprintf("codex responses pass-through body rewrite disabled: read body failed: %s", err.Error()))
+			}
+		}
 	} else {
 		convertedRequest, err := adaptor.ConvertOpenAIResponsesRequest(c, info, *request)
 		if err != nil {
@@ -102,14 +141,23 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 			}
 		}
 
-		logger.LogDebug(c, "requestBody: %s", jsonData)
-		body, size, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
-		if err != nil {
-			return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+		requestBodyBytes = append([]byte(nil), jsonData...)
+		if rewrittenBody, ok := rewriteResponsesCustomPromptIfNeeded(c, info, requestBodyBytes); ok {
+			requestBodyBytes = rewrittenBody
 		}
-		defer closer.Close()
+		logger.LogDebug(c, "requestBody: %s", requestBodyBytes)
+		if shouldUseResponsesTranscriptReplay(info) {
+			relaycommon.PrepareResponsesTranscriptReplay(info, requestBodyBytes)
+			if sanitizedBody, ok := sanitizeResponsesTranscriptInitialRequest(c, info, requestBodyBytes); ok {
+				requestBodyBytes = sanitizedBody
+			}
+		}
+		body, closer, newAPIError := newResponsesOutboundJSONBody(info, requestBodyBytes)
+		if newAPIError != nil {
+			return newAPIError
+		}
+		requestBodyCloser = closer
 		jsonData = nil
-		info.UpstreamRequestBodySize = size
 		requestBody = body
 	}
 
@@ -125,18 +173,37 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		httpResp = resp.(*http.Response)
 
 		if httpResp.StatusCode != http.StatusOK {
-			newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
-			// reset status code 重置状态码
-			service.ResetStatusCode(newAPIError, statusCodeMappingStr)
-			return newAPIError
+			if shouldUseResponsesTranscriptReplay(info) {
+				httpResp, newAPIError = retryCodexResponsesTranscriptReplay(c, info, adaptor, httpResp, requestBodyBytes, statusCodeMappingStr)
+				if newAPIError != nil {
+					return newAPIError
+				}
+			} else {
+				newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+				// reset status code 重置状态码
+				service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+				return newAPIError
+			}
 		}
 	}
 
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
 	if newAPIError != nil {
+		replayResp, replayError := retryCodexResponsesTranscriptReplayAfterStreamError(c, info, adaptor, newAPIError, requestBodyBytes, statusCodeMappingStr)
+		if replayError != nil {
+			return replayError
+		}
+		if replayResp != nil {
+			usage, newAPIError = adaptor.DoResponse(c, replayResp, info)
+		}
+	}
+	if newAPIError != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
+	}
+	if shouldUseResponsesTranscriptReplay(info) {
+		relaycommon.CommitResponsesTranscriptReplay(info)
 	}
 
 	usageDto := usage.(*dto.Usage)
@@ -163,4 +230,311 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 		service.PostTextConsumeQuota(c, info, usageDto, nil)
 	}
 	return nil
+}
+
+func shouldUseResponsesTranscriptReplay(info *relaycommon.RelayInfo) bool {
+	if info == nil || info.RelayMode != relayconstant.RelayModeResponses {
+		return false
+	}
+	return info.ChannelOtherSettings.ResponsesTranscriptReplayEnabled
+}
+
+func shouldConsiderResponsesCustomPromptRewrite(info *relaycommon.RelayInfo) bool {
+	if info == nil || !info.ChannelOtherSettings.CustomPromptRewriteEnabled {
+		return false
+	}
+	return info.RelayMode == relayconstant.RelayModeResponses ||
+		info.RelayMode == relayconstant.RelayModeResponsesCompact
+}
+
+func shouldRewriteResponsesCustomPrompt(info *relaycommon.RelayInfo) bool {
+	if !shouldConsiderResponsesCustomPromptRewrite(info) {
+		return false
+	}
+	return isResponsesXHighReasoningEffort(info.ReasoningEffort)
+}
+
+func rewriteResponsesCustomPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, requestBodyBytes []byte) ([]byte, bool) {
+	if !shouldConsiderResponsesCustomPromptRewrite(info) || len(requestBodyBytes) == 0 {
+		return nil, false
+	}
+
+	if bodyEffort := responsesReasoningEffortFromBody(requestBodyBytes); bodyEffort != "" {
+		info.ReasoningEffort = bodyEffort
+	}
+	if !shouldRewriteResponsesCustomPrompt(info) {
+		return nil, false
+	}
+
+	rewrittenBody, ok, reason, err := relaycommon.RewriteResponsesCustomPrompt(requestBodyBytes)
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf("codex responses custom prompt rewrite skipped on channel #%d: %s: %v", info.ChannelId, reason, err))
+		return nil, false
+	}
+	if !ok {
+		return nil, false
+	}
+
+	logResponsesInfo(c, fmt.Sprintf(
+		"codex responses custom prompt rewrite on channel #%d: %s; original_body_bytes=%d rewritten_body_bytes=%d",
+		info.ChannelId,
+		reason,
+		len(requestBodyBytes),
+		len(rewrittenBody),
+	))
+	return rewrittenBody, true
+}
+
+func responsesReasoningEffortFromBody(requestBodyBytes []byte) string {
+	if len(requestBodyBytes) == 0 {
+		return ""
+	}
+	if effort := strings.TrimSpace(gjsonString(requestBodyBytes, "reasoning.effort")); effort != "" {
+		return effort
+	}
+	model := strings.TrimSpace(gjsonString(requestBodyBytes, "model"))
+	if model == "" {
+		return ""
+	}
+	effort, _ := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(model)
+	return effort
+}
+
+func gjsonString(data []byte, path string) string {
+	value := gjson.GetBytes(data, path)
+	if value.Type != gjson.String {
+		return ""
+	}
+	return value.String()
+}
+
+func isResponsesXHighReasoningEffort(effort string) bool {
+	return strings.EqualFold(strings.TrimSpace(effort), "xhigh")
+}
+
+func newResponsesOutboundJSONBody(info *relaycommon.RelayInfo, requestBody []byte) (io.Reader, io.Closer, *types.NewAPIError) {
+	body, size, closer, err := relaycommon.NewOutboundJSONBody(requestBody)
+	if err != nil {
+		return nil, nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
+	}
+	if info != nil {
+		info.UpstreamRequestBodySize = size
+	}
+	return body, closer, nil
+}
+
+func sanitizeResponsesTranscriptInitialRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBodyBytes []byte) ([]byte, bool) {
+	if !shouldUseResponsesTranscriptReplay(info) || len(requestBodyBytes) == 0 {
+		return nil, false
+	}
+	sanitizedBody, ok, reason := relaycommon.SanitizeResponsesTranscriptInitialRequest(requestBodyBytes)
+	if !ok {
+		return nil, false
+	}
+	relaycommon.UpdateResponsesTranscriptReplayRequest(info, sanitizedBody, false)
+	logResponsesInfo(c, fmt.Sprintf("codex responses transcript preflight sanitized on channel #%d: %s; original_body_bytes=%d sanitized_body_bytes=%d", info.ChannelId, reason, len(requestBodyBytes), len(sanitizedBody)))
+	return sanitizedBody, true
+}
+
+func logResponsesInfo(c *gin.Context, msg string) {
+	if c == nil {
+		logger.LogInfo(nil, msg)
+		return
+	}
+	logger.LogInfo(c, msg)
+}
+
+type responsesTranscriptReplayErrorPayload struct {
+	Error types.OpenAIError `json:"error"`
+}
+
+func retryCodexResponsesTranscriptReplay(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	adaptor relaychannel.Adaptor,
+	httpResp *http.Response,
+	requestBodyBytes []byte,
+	statusCodeMappingStr string,
+) (*http.Response, *types.NewAPIError) {
+	responseBody, readErr := captureHTTPErrorBody(httpResp)
+	if readErr != nil {
+		newAPIError := types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+		return nil, newAPIError
+	}
+
+	if !shouldRetryResponsesTranscriptReplay(httpResp.StatusCode, responseBody, requestBodyBytes) {
+		if httpResp.StatusCode == http.StatusRequestEntityTooLarge {
+			logResponsesTranscriptRequestShape(c, info, "upstream_413_before_retry", requestBodyBytes, httpResp.StatusCode)
+		}
+		return nil, newAPIErrorFromCapturedHTTPError(c, httpResp, responseBody, statusCodeMappingStr, false)
+	}
+
+	replayBody, ok, reason := relaycommon.BuildResponsesTranscriptReplayRequest(info, requestBodyBytes)
+	if !ok {
+		logger.LogWarn(c, fmt.Sprintf("codex responses transcript replay skipped on channel #%d: %s", info.ChannelId, reason))
+		return nil, newAPIErrorFromCapturedHTTPError(c, httpResp, responseBody, statusCodeMappingStr, true)
+	}
+
+	relaycommon.UpdateResponsesTranscriptReplayRequest(info, replayBody, true)
+	replayRequestBody, replayCloser, newAPIError := newResponsesOutboundJSONBody(info, replayBody)
+	if newAPIError != nil {
+		return nil, markResponsesTranscriptReplaySkipRetry(newAPIError)
+	}
+	defer replayCloser.Close()
+
+	logger.LogInfo(c, fmt.Sprintf("codex responses transcript replay on channel #%d: %s; original_body_bytes=%d retry_body_bytes=%d", info.ChannelId, reason, len(requestBodyBytes), len(replayBody)))
+	resp, err := adaptor.DoRequest(c, info, replayRequestBody)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+	}
+	replayResp := resp.(*http.Response)
+	if replayResp.StatusCode == http.StatusOK {
+		return replayResp, nil
+	}
+	if replayResp.StatusCode == http.StatusRequestEntityTooLarge {
+		logResponsesTranscriptRequestShape(c, info, "upstream_413_after_retry", replayBody, replayResp.StatusCode)
+	}
+
+	replayResponseBody, readErr := captureHTTPErrorBody(replayResp)
+	if readErr != nil {
+		newAPIError := types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+		return nil, newAPIError
+	}
+	return nil, newAPIErrorFromCapturedHTTPError(c, replayResp, replayResponseBody, statusCodeMappingStr, true)
+}
+
+func retryCodexResponsesTranscriptReplayAfterStreamError(
+	c *gin.Context,
+	info *relaycommon.RelayInfo,
+	adaptor relaychannel.Adaptor,
+	streamErr *types.NewAPIError,
+	requestBodyBytes []byte,
+	statusCodeMappingStr string,
+) (*http.Response, *types.NewAPIError) {
+	if c == nil || c.Writer.Written() || !shouldUseResponsesTranscriptReplay(info) || streamErr == nil || len(requestBodyBytes) == 0 {
+		return nil, nil
+	}
+	if info.ResponsesTranscriptReplay != nil && info.ResponsesTranscriptReplay.Replayed {
+		return nil, nil
+	}
+	responseBody, err := responsesTranscriptReplayErrorBody(streamErr)
+	if err != nil {
+		logger.LogWarn(c, fmt.Sprintf("codex responses transcript replay skipped on channel #%d: marshal stream error failed: %s", info.ChannelId, err.Error()))
+		return nil, nil
+	}
+	statusCode := streamErr.StatusCode
+	if statusCode < http.StatusBadRequest {
+		statusCode = http.StatusInternalServerError
+	}
+	if !shouldRetryResponsesTranscriptReplay(statusCode, responseBody, requestBodyBytes) {
+		return nil, nil
+	}
+
+	replayBody, ok, reason := relaycommon.BuildResponsesTranscriptReplayRequest(info, requestBodyBytes)
+	if !ok {
+		logger.LogWarn(c, fmt.Sprintf("codex responses transcript replay skipped on channel #%d after stream error: %s", info.ChannelId, reason))
+		return nil, markResponsesTranscriptReplaySkipRetry(streamErr)
+	}
+
+	relaycommon.UpdateResponsesTranscriptReplayRequest(info, replayBody, true)
+	replayRequestBody, replayCloser, newAPIError := newResponsesOutboundJSONBody(info, replayBody)
+	if newAPIError != nil {
+		return nil, markResponsesTranscriptReplaySkipRetry(newAPIError)
+	}
+	defer replayCloser.Close()
+
+	logger.LogInfo(c, fmt.Sprintf("codex responses transcript replay after stream error on channel #%d: %s; original_body_bytes=%d retry_body_bytes=%d", info.ChannelId, reason, len(requestBodyBytes), len(replayBody)))
+	resp, err := adaptor.DoRequest(c, info, replayRequestBody)
+	if err != nil {
+		return nil, types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+	}
+	replayResp := resp.(*http.Response)
+	if replayResp.StatusCode == http.StatusOK {
+		return replayResp, nil
+	}
+	if replayResp.StatusCode == http.StatusRequestEntityTooLarge {
+		logResponsesTranscriptRequestShape(c, info, "upstream_413_after_stream_retry", replayBody, replayResp.StatusCode)
+	}
+
+	replayResponseBody, readErr := captureHTTPErrorBody(replayResp)
+	if readErr != nil {
+		newAPIError := types.NewOpenAIError(readErr, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError, types.ErrOptionWithSkipRetry())
+		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+		return nil, newAPIError
+	}
+	return nil, newAPIErrorFromCapturedHTTPError(c, replayResp, replayResponseBody, statusCodeMappingStr, true)
+}
+
+func responsesTranscriptReplayErrorBody(newAPIError *types.NewAPIError) ([]byte, error) {
+	if newAPIError == nil {
+		return nil, fmt.Errorf("missing stream error")
+	}
+	return common.Marshal(responsesTranscriptReplayErrorPayload{
+		Error: newAPIError.ToOpenAIError(),
+	})
+}
+
+func shouldRetryResponsesTranscriptReplay(statusCode int, responseBody []byte, requestBody []byte) bool {
+	return relaycommon.IsResponsesTranscriptReplayError(statusCode, responseBody)
+}
+
+func logResponsesTranscriptRequestShape(c *gin.Context, info *relaycommon.RelayInfo, phase string, requestBody []byte, statusCode int) {
+	shape := relaycommon.InspectResponsesTranscriptRequestShape(requestBody)
+	channelID := 0
+	if info != nil {
+		channelID = info.ChannelId
+	}
+	logger.LogWarn(c, fmt.Sprintf(
+		"codex responses request diagnostics on channel #%d: phase=%s status=%d body_bytes=%d input_exists=%t input_array=%t input_items=%d previous_response_id=%t prompt_cache_key=%t full_transcript=%t replacement_input=%t compaction_items=%d assistant_messages=%d function_calls=%d custom_tool_calls=%d reasoning_items=%d encrypted_content_items=%d inline_image_items=%d",
+		channelID,
+		phase,
+		statusCode,
+		shape.BodyBytes,
+		shape.InputExists,
+		shape.InputIsArray,
+		shape.InputItems,
+		shape.HasPreviousResponseID,
+		shape.HasPromptCacheKey,
+		shape.LooksFullTranscript,
+		shape.LooksReplacementInput,
+		shape.CompactionItems,
+		shape.AssistantMessageItems,
+		shape.FunctionCallItems,
+		shape.CustomToolCallItems,
+		shape.ReasoningItems,
+		shape.EncryptedContentItems,
+		shape.InlineImageItems,
+	))
+}
+
+func captureHTTPErrorBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("empty upstream error response")
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	service.CloseResponseBodyGracefully(resp)
+	if err != nil {
+		return nil, err
+	}
+	return responseBody, nil
+}
+
+func newAPIErrorFromCapturedHTTPError(c *gin.Context, resp *http.Response, responseBody []byte, statusCodeMappingStr string, skipRetry bool) *types.NewAPIError {
+	respCopy := *resp
+	respCopy.Body = io.NopCloser(bytes.NewReader(responseBody))
+	newAPIError := service.RelayErrorHandler(c.Request.Context(), &respCopy, false)
+	if skipRetry {
+		newAPIError = markResponsesTranscriptReplaySkipRetry(newAPIError)
+	}
+	service.ResetStatusCode(newAPIError, statusCodeMappingStr)
+	return newAPIError
+}
+
+func markResponsesTranscriptReplaySkipRetry(newAPIError *types.NewAPIError) *types.NewAPIError {
+	if newAPIError == nil {
+		return nil
+	}
+	return types.NewError(newAPIError, newAPIError.GetErrorCode(), types.ErrOptionWithSkipRetry())
 }

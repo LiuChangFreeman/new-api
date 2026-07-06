@@ -17,6 +17,30 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const (
+	responsesStreamEventCompleted  = "response.completed"
+	responsesStreamEventCreated    = "response.created"
+	responsesStreamEventError      = "response.error"
+	responsesStreamEventFailed     = "response.failed"
+	responsesStreamEventInProgress = "response.in_progress"
+	responsesStreamEventTextDelta  = "response.output_text.delta"
+)
+
+type responsesStreamDataEvent struct {
+	Response dto.ResponsesStreamResponse
+	Data     string
+}
+
+type responsesStreamFailurePayload struct {
+	Type     string                         `json:"type"`
+	Response responsesStreamFailureResponse `json:"response"`
+}
+
+type responsesStreamFailureResponse struct {
+	Status string            `json:"status"`
+	Error  types.OpenAIError `json:"error"`
+}
+
 func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	defer service.CloseResponseBodyGracefully(resp)
 
@@ -33,6 +57,7 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
+	relaycommon.ObserveResponsesTranscriptReplayResponseBody(info, responseBody)
 
 	if responsesResponse.HasImageGenerationCall() {
 		c.Set("image_generation_call", true)
@@ -78,6 +103,41 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	var usage = &dto.Usage{}
 	var responseTextBuilder strings.Builder
+	var streamErr *types.NewAPIError
+	var sentDownstream bool
+	var sawCompleted bool
+	var pendingPrelude []responsesStreamDataEvent
+
+	flushPendingPrelude := func() {
+		for _, event := range pendingPrelude {
+			sendResponsesStreamData(c, event.Response, event.Data)
+			sentDownstream = true
+		}
+		pendingPrelude = nil
+	}
+
+	sendStreamData := func(streamResponse dto.ResponsesStreamResponse, data string) {
+		if shouldBufferResponsesStreamPrelude(info, streamResponse.Type, sentDownstream) {
+			pendingPrelude = append(pendingPrelude, responsesStreamDataEvent{
+				Response: streamResponse,
+				Data:     data,
+			})
+			return
+		}
+		flushPendingPrelude()
+		sendResponsesStreamData(c, streamResponse, data)
+		sentDownstream = true
+	}
+
+	sendStreamFailure := func(newAPIError *types.NewAPIError) {
+		if newAPIError == nil {
+			return
+		}
+		flushPendingPrelude()
+		streamResponse, data := responsesStreamFailureEvent(newAPIError)
+		sendResponsesStreamData(c, streamResponse, data)
+		sentDownstream = true
+	}
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 
@@ -88,9 +148,24 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
-		sendResponsesStreamData(c, streamResponse, data)
+		relaycommon.ObserveResponsesTranscriptReplayStreamEvent(info, data)
+		if isResponsesStreamTerminalError(streamResponse.Type) {
+			openAIError := responsesStreamOpenAIError(streamResponse)
+			streamErr = types.WithOpenAIError(openAIError, http.StatusInternalServerError)
+			logResponsesStreamTerminalError(c, info, streamResponse.Type, openAIError, data)
+			if !shouldDeferResponsesStreamErrorToHandler(c, sentDownstream) {
+				flushPendingPrelude()
+				sendResponsesStreamData(c, streamResponse, data)
+				sentDownstream = true
+			}
+			sr.Stop(streamErr)
+			return
+		}
+
+		sendStreamData(streamResponse, data)
 		switch streamResponse.Type {
-		case "response.completed":
+		case responsesStreamEventCompleted:
+			sawCompleted = true
 			if streamResponse.Response != nil {
 				if streamResponse.Response.Usage != nil {
 					if streamResponse.Response.Usage.InputTokens != 0 {
@@ -112,7 +187,8 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					c.Set("image_generation_call_size", streamResponse.Response.GetSize())
 				}
 			}
-		case "response.output_text.delta":
+			sr.Done()
+		case responsesStreamEventTextDelta:
 			// 处理输出文本
 			responseTextBuilder.WriteString(streamResponse.Delta)
 		case dto.ResponsesOutputTypeItemDone:
@@ -129,6 +205,20 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		}
 	})
+
+	if streamErr == nil {
+		streamErr = responsesStreamCompletionError(info, sawCompleted)
+		if streamErr != nil {
+			logResponsesStreamIncomplete(c, info, sentDownstream, streamErr)
+			if !shouldDeferResponsesStreamErrorToHandler(c, sentDownstream) {
+				sendStreamFailure(streamErr)
+			}
+		}
+	}
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	flushPendingPrelude()
 
 	if usage.CompletionTokens == 0 {
 		// 计算输出文本的 token 数量
@@ -147,4 +237,186 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 
 	return usage, nil
+}
+
+func isResponsesStreamTerminalError(eventType string) bool {
+	return eventType == responsesStreamEventError || eventType == responsesStreamEventFailed
+}
+
+func isResponsesStreamPrelude(eventType string) bool {
+	return eventType == responsesStreamEventCreated || eventType == responsesStreamEventInProgress
+}
+
+func shouldBufferResponsesStreamPrelude(info *relaycommon.RelayInfo, eventType string, sentDownstream bool) bool {
+	if sentDownstream || !isResponsesStreamPrelude(eventType) {
+		return false
+	}
+	return info != nil && info.ResponsesTranscriptReplay != nil && !info.ResponsesTranscriptReplay.Replayed
+}
+
+func responsesStreamOpenAIError(streamResponse dto.ResponsesStreamResponse) types.OpenAIError {
+	if openAIError := dto.GetOpenAIError(streamResponse.Error); openAIError != nil {
+		if openAIError.Message != "" || openAIError.Type != "" || openAIError.Code != nil {
+			return *openAIError
+		}
+	}
+	if streamResponse.Response != nil {
+		if openAIError := streamResponse.Response.GetOpenAIError(); openAIError != nil {
+			if openAIError.Message != "" || openAIError.Type != "" || openAIError.Code != nil {
+				return *openAIError
+			}
+		}
+	}
+	return responsesStreamFallbackOpenAIError(streamResponse)
+}
+
+func responsesStreamFallbackOpenAIError(streamResponse dto.ResponsesStreamResponse) types.OpenAIError {
+	message := fmt.Sprintf("responses stream terminal event: %s", streamResponse.Type)
+	if streamResponse.Response != nil {
+		if status := common.JsonRawMessageToString(streamResponse.Response.Status); status != "" {
+			message += fmt.Sprintf(" status=%s", status)
+		}
+		if streamResponse.Response.IncompleteDetails != nil {
+			if details, err := common.Marshal(streamResponse.Response.IncompleteDetails); err == nil {
+				message += fmt.Sprintf(" incomplete_details=%s", details)
+			}
+		}
+	}
+	return types.OpenAIError{
+		Message: message,
+		Type:    string(types.ErrorCodeBadResponse),
+		Code:    string(types.ErrorCodeBadResponse),
+	}
+}
+
+func shouldDeferResponsesStreamErrorToHandler(c *gin.Context, sentDownstream bool) bool {
+	if sentDownstream || c == nil || c.Writer == nil {
+		return false
+	}
+	return !c.Writer.Written()
+}
+
+func responsesStreamCompletionError(info *relaycommon.RelayInfo, sawCompleted bool) *types.NewAPIError {
+	if sawCompleted {
+		return nil
+	}
+	if info == nil || info.StreamStatus == nil {
+		return nil
+	}
+
+	status := info.StreamStatus
+	switch status.EndReason {
+	case relaycommon.StreamEndReasonEOF, relaycommon.StreamEndReasonDone:
+		return types.NewOpenAIError(
+			fmt.Errorf("responses stream closed before completion event: %s", status.Summary()),
+			types.ErrorCodeBadResponse,
+			http.StatusBadGateway,
+		)
+	case relaycommon.StreamEndReasonTimeout, relaycommon.StreamEndReasonScannerErr, relaycommon.StreamEndReasonPanic, relaycommon.StreamEndReasonPingFail:
+		return types.NewOpenAIError(
+			fmt.Errorf("responses stream interrupted before completion event: %s", status.Summary()),
+			types.ErrorCodeBadResponse,
+			http.StatusBadGateway,
+		)
+	case relaycommon.StreamEndReasonClientGone:
+		return types.NewOpenAIError(
+			fmt.Errorf("responses stream client disconnected before completion event: %s", status.Summary()),
+			types.ErrorCodeBadResponse,
+			499,
+			types.ErrOptionWithSkipRetry(),
+		)
+	case relaycommon.StreamEndReasonHandlerStop:
+		if status.HasErrors() {
+			return types.NewOpenAIError(
+				fmt.Errorf("responses stream handler stopped before completion event: %s", status.Summary()),
+				types.ErrorCodeBadResponse,
+				http.StatusBadGateway,
+			)
+		}
+	}
+	return nil
+}
+
+func responsesStreamFailureEvent(newAPIError *types.NewAPIError) (dto.ResponsesStreamResponse, string) {
+	openAIError := types.OpenAIError{
+		Message: string(types.ErrorCodeBadResponse),
+		Type:    string(types.ErrorCodeBadResponse),
+		Code:    string(types.ErrorCodeBadResponse),
+	}
+	if newAPIError != nil {
+		openAIError = newAPIError.ToOpenAIError()
+	}
+	streamResponse := dto.ResponsesStreamResponse{
+		Type: responsesStreamEventFailed,
+	}
+	payload := responsesStreamFailurePayload{
+		Type: responsesStreamEventFailed,
+		Response: responsesStreamFailureResponse{
+			Status: "failed",
+			Error:  openAIError,
+		},
+	}
+	data, err := common.Marshal(payload)
+	if err != nil {
+		return streamResponse, fmt.Sprintf(`{"type":"%s","response":{"status":"failed","error":{"message":"%s","type":"%s","code":"%s"}}}`,
+			responsesStreamEventFailed,
+			string(types.ErrorCodeBadResponse),
+			string(types.ErrorCodeBadResponse),
+			string(types.ErrorCodeBadResponse),
+		)
+	}
+	return streamResponse, string(data)
+}
+
+func logResponsesStreamTerminalError(c *gin.Context, info *relaycommon.RelayInfo, eventType string, openAIError types.OpenAIError, data string) {
+	channelID := 0
+	if info != nil {
+		channelID = info.ChannelId
+	}
+	logger.LogError(c, fmt.Sprintf(
+		"responses stream terminal event on channel #%d: event=%s error_type=%s code=%v message=%s",
+		channelID,
+		eventType,
+		openAIError.Type,
+		openAIError.Code,
+		truncateResponsesStreamErrorMessage(openAIError.Message),
+	))
+	if openAIError.Code == string(types.ErrorCodeBadResponse) && strings.HasPrefix(openAIError.Message, "responses stream terminal event:") {
+		logger.LogError(c, fmt.Sprintf(
+			"responses stream terminal event raw payload on channel #%d: event=%s payload=%s",
+			channelID,
+			eventType,
+			truncateResponsesStreamErrorMessage(data),
+		))
+	}
+}
+
+func logResponsesStreamIncomplete(c *gin.Context, info *relaycommon.RelayInfo, sentDownstream bool, newAPIError *types.NewAPIError) {
+	channelID := 0
+	streamSummary := "StreamStatus<nil>"
+	if info != nil {
+		channelID = info.ChannelId
+		if info.StreamStatus != nil {
+			streamSummary = info.StreamStatus.Summary()
+		}
+	}
+	message := ""
+	if newAPIError != nil {
+		message = newAPIError.Error()
+	}
+	logger.LogError(c, fmt.Sprintf(
+		"responses stream ended before completion event on channel #%d: sent_downstream=%t stream=%s error=%s",
+		channelID,
+		sentDownstream,
+		streamSummary,
+		truncateResponsesStreamErrorMessage(message),
+	))
+}
+
+func truncateResponsesStreamErrorMessage(message string) string {
+	const maxMessageBytes = 512
+	if len(message) <= maxMessageBytes {
+		return message
+	}
+	return message[:maxMessageBytes] + "...(truncated)"
 }
